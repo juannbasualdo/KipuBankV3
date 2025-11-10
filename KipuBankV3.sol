@@ -6,14 +6,23 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-/// @notice Minimal metadata interface to query decimals if available.
+/// @notice Interfaz mínima de metadatos para consultar `decimals()` si está disponible.
 interface IERC20Metadata is IERC20 {
+    /// @notice Devuelve la cantidad de decimales del token.
     function decimals() external view returns (uint8);
 }
 
-/// @notice Minimal Chainlink Aggregator V3 interface (TOKEN/USD).
+/// @notice Interfaz mínima de Chainlink Aggregator V3 (precio TOKEN/USD).
 interface AggregatorV3Interface {
+    /// @notice Devuelve la cantidad de decimales del oráculo.
     function decimals() external view returns (uint8);
+    /// @notice Retorna los datos de la última ronda del oráculo.
+    /// @dev `answer` representa el precio TOKEN/USD con `decimals()` dígitos.
+    /// @return roundId ID de la ronda
+    /// @return answer Precio actual (puede ser negativo si el oráculo lo señalara, se valida en el contrato)
+    /// @return startedAt Marca temporal de inicio
+    /// @return updatedAt Marca temporal de última actualización
+    /// @return answeredInRound Ronda en la que se respondió
     function latestRoundData()
         external
         view
@@ -26,9 +35,16 @@ interface AggregatorV3Interface {
         );
 }
 
-/// @notice Minimal Uniswap V2 interfaces in ^0.8 to avoid pragma conflicts.
+/// @notice Interfaces mínimas de Uniswap V2 en ^0.8 para evitar conflictos de pragma.
 interface IUniswapV2Router02 {
+    /// @notice Dirección de WETH en la red actual.
     function WETH() external pure returns (address);
+    /// @notice Swapea ETH por tokens exactos según un mínimo de salida.
+    /// @param amountOutMin Mínimo de tokens a recibir
+    /// @param path Ruta de swap (por ejemplo [WETH, USDC])
+    /// @param to Destinatario de los tokens
+    /// @param deadline Tiempo límite
+    /// @return amounts Montos intermedios y final del swap
     function swapExactETHForTokens(
         uint amountOutMin,
         address[] calldata path,
@@ -36,6 +52,13 @@ interface IUniswapV2Router02 {
         uint deadline
     ) external payable returns (uint[] memory amounts);
 
+    /// @notice Swapea tokens por tokens exactos según un mínimo de salida.
+    /// @param amountIn Monto de entrada
+    /// @param amountOutMin Mínimo de salida en el token destino
+    /// @param path Ruta de swap (por ejemplo [TOKEN, USDC])
+    /// @param to Destinatario de los tokens
+    /// @param deadline Tiempo límite
+    /// @return amounts Montos intermedios y final del swap
     function swapExactTokensForTokens(
         uint amountIn,
         uint amountOutMin,
@@ -46,9 +69,11 @@ interface IUniswapV2Router02 {
 }
 
 interface IUniswapV2Factory {
+    /// @notice Devuelve la dirección del par para `tokenA` y `tokenB` si existe.
     function getPair(address tokenA, address tokenB) external view returns (address pair);
 }
 
+/// @notice Configuración auxiliar por token (compatibilidad V2).
 struct TokenConfig {
     bool supported;         // Habilitado (para vistas / límites de retiro)
     bool isNative;          // ETH pseudo-token (address(0))
@@ -59,6 +84,7 @@ struct TokenConfig {
 
 /// @title KipuBankV3
 /// @notice Acepta ETH/USDC/ERC20; si no es USDC, se swapea a USDC (router V2) y se acredita en USDC.
+/// @dev Integra Uniswap V2 para swaps, respeta un tope global en USD(6) (`bankCapUsd6`) y mantiene compatibilidad conceptual con KipuBankV2.
 contract KipuBankV3 is AccessControl, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -66,31 +92,34 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
                                 CONSTANTES
     //////////////////////////////////////////////////////////////*/
 
+    /// @notice Rol administrativo para operaciones de configuración.
     bytes32 public constant ROLE_ADMIN = keccak256("ROLE_ADMIN");
+    /// @notice Pseudo-token para ETH (dirección cero).
     address public constant NATIVE_TOKEN = address(0);
+    /// @notice Cantidad de decimales estándar para USD(6) / USDC.
     uint8 public constant USD_DECIMALS = 6; // USDC estándar (6)
 
     /*//////////////////////////////////////////////////////////////
                                 ESTADO
     //////////////////////////////////////////////////////////////*/
 
-    // Cap global en USD(6) (= USDC 6 dec)
+    /// @notice Tope global del banco expresado en USD(6) (= USDC 6 dec).
     uint256 public immutable bankCapUsd6;
-    // Total acumulado acreditado en USD(6)
+    /// @notice Total acumulado acreditado en USD(6).
     uint256 public totalDepositedUsd6;
 
-    // router/factory y USDC
+    /// @notice Router/Factory de Uniswap V2 y token USDC.
     IUniswapV2Router02 public immutable router;
     IUniswapV2Factory  public immutable factory;
     address public immutable USDC;
 
-    // balances en el banco (solo significativo para USDC en V3)
+    /// @notice Balances por (token -> usuario). En V3 el saldo significativo es el asociado a USDC.
     mapping(address => mapping(address => uint256)) private balances;
 
-    // configuración por token (para vistas/oráculos/withdraw limits, compatibilidad V2)
+    /// @notice Configuración por token (para vistas, oráculos y límites de retiro; compatibilidad con V2).
     mapping(address => TokenConfig) public tokenConfig;
 
-    // contadores
+    /// @notice Contadores de operaciones.
     uint256 public depositCount;
     uint256 public withdrawCount;
 
@@ -98,26 +127,61 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
                                   ERRORES
     //////////////////////////////////////////////////////////////*/
 
+    /// @notice Error: monto cero.
     error ZeroAmount();
+    /// @notice Error: token no soportado.
     error UnsupportedToken(address token);
+    /// @notice Error: el intento de depósito supera el tope global del banco.
     error CapExceeded(uint256 attempted, uint256 cap);
+    /// @notice Error: saldo insuficiente para retirar.
     error InsufficientBalance(uint256 have, uint256 want);
+    /// @notice Error: no existe par directo TOKEN/USDC en la factory V2.
     error PairDoesNotExist(address tokenIn, address tokenOut);
+    /// @notice Error: no se definió un price feed de Chainlink para el token consultado.
     error PriceFeedNotSet(address token);
+    /// @notice Error: el oráculo devolvió un precio negativo o inválido.
     error PriceNegative();
 
     /*//////////////////////////////////////////////////////////////
                                   EVENTOS
     //////////////////////////////////////////////////////////////*/
 
+    /// @notice Emite información al acreditar un depósito (en USDC) a un usuario.
+    /// @param tokenCredited Token acreditado (USDC en V3 tras el swap)
+    /// @param user Usuario que depositó
+    /// @param amountIn Cantidad ingresada (en el token de entrada)
+    /// @param newBalance Nuevo balance del usuario en el token acreditado
+    /// @param usdcCredited Cantidad concreta de USDC acreditada
     event Deposit(address indexed tokenCredited, address indexed user, uint256 amountIn, uint256 newBalance, uint256 usdcCredited);
+
+    /// @notice Emite información al procesar un retiro en USDC.
+    /// @param tokenDebited Token debitado (USDC en V3)
+    /// @param user Usuario que retira
+    /// @param amount Monto retirado
+    /// @param newBalance Nuevo balance del usuario tras el retiro
     event Withdraw(address indexed tokenDebited, address indexed user, uint256 amount, uint256 newBalance);
+
+    /// @notice Emite información cuando se configura/actualiza un token soportado.
+    /// @param token Dirección del token
+    /// @param supported Si está habilitado para vistas/validaciones
+    /// @param isNative Si representa al pseudo-token nativo (ETH)
+    /// @param decimals Decimales
+    /// @param withdrawLimit Límite por retiro
+    /// @param priceFeed Dirección del oráculo Chainlink (si aplica)
     event TokenConfigured(address indexed token, bool supported, bool isNative, uint8 decimals, uint256 withdrawLimit, address priceFeed);
 
     /*//////////////////////////////////////////////////////////////
                                 CONSTRUCTOR
     //////////////////////////////////////////////////////////////*/
 
+    /// @notice Inicializa el contrato con el tope global en USD(6), direcciones base y límites de retiro.
+    /// @dev Configura roles de administración, parámetros de ETH y USDC, y dependencias de Uniswap V2.
+    /// @param _bankCapUsd6 Tope global del banco en USD(6)
+    /// @param ethPriceFeed Oráculo de precio ETH/USD (Chainlink)
+    /// @param usdcToken Dirección del token USDC
+    /// @param routerV2 Dirección del router de Uniswap V2
+    /// @param factoryV2 Dirección de la factory de Uniswap V2
+    /// @param ethWithdrawLimit Límite por retiro para ETH (en wei)
     constructor(
         uint256 _bankCapUsd6,
         address ethPriceFeed,
@@ -171,6 +235,8 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
                                 MODIFIERS
     //////////////////////////////////////////////////////////////*/
 
+    /// @notice Exige que el monto sea distinto de cero.
+    /// @param amount Monto a validar
     modifier nonZero(uint256 amount) {
         if (amount == 0) revert ZeroAmount();
         _;
@@ -180,8 +246,13 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
                                   ADMIN
     //////////////////////////////////////////////////////////////*/
 
-    /// @notice Agrega/actualiza token (para vistas/oráculos/lim. retiro).
+    /// @notice Agrega o actualiza la configuración de un token (para vistas/oráculos/límites de retiro).
     /// @dev En V3 se acredita USDC; otros tokens sólo se aceptan para depósito y se swapean.
+    /// @param token Dirección del token a configurar (no puede ser address(0) para esta función)
+    /// @param supported Si el token estará habilitado a nivel de vistas o límites
+    /// @param tokenDecimals Decimales del token (si es 0 se intenta detectar vía IERC20Metadata)
+    /// @param withdrawLimit Límite por retiro en unidades del token
+    /// @param priceFeed Dirección del oráculo Chainlink TOKEN/USD (opcional)
     function setTokenConfig(
         address token,
         bool supported,
@@ -214,12 +285,20 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
                                    VISTAS
     //////////////////////////////////////////////////////////////*/
 
-    function getBalance(address token, address user) external view returns (uint256) {
+    /// @notice Devuelve el balance del usuario en un token específico.
+    /// @param token Dirección del token a consultar
+    /// @param user Dirección del usuario
+    /// @return balance Cantidad de `token` asignada al `user`
+    function getBalance(address token, address user) external view returns (uint256 balance) {
         return balances[token][user];
     }
 
-    /// @dev Estimación en USD(6); 1:1 para USDC.
-    function getUsdBalance(address token, address user) external view returns (uint256) {
+    /// @notice Estima el balance del usuario expresado en USD(6).
+    /// @dev Para USDC retorna 1:1; para otros tokens se usa el oráculo asociado (si existe).
+    /// @param token Dirección del token a consultar
+    /// @param user Dirección del usuario
+    /// @return usdBalance Balance estimado en USD(6)
+    function getUsdBalance(address token, address user) external view returns (uint256 usdBalance) {
         uint256 amt = balances[token][user];
         if (token == USDC) return amt;
         return _toUsd(token, amt);
@@ -230,6 +309,7 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
     //////////////////////////////////////////////////////////////*/
 
     /// @notice Depósito directo de USDC.
+    /// @param amount Monto de USDC a depositar
     function depositUSDC(uint256 amount)
         external
         nonReentrant
@@ -250,6 +330,7 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
     }
 
     /// @notice Depósito de ETH: se swapea a USDC usando el router V2.
+    /// @param amountOutMin Mínimo de USDC a recibir al swappear
     function depositETH(uint256 amountOutMin)
         external
         payable
@@ -278,6 +359,9 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
     }
 
     /// @notice Depósito de un ERC20 distinto a USDC -> swap a USDC dentro del contrato.
+    /// @param token Dirección del token de entrada (distinto a USDC)
+    /// @param amount Cantidad del token de entrada a depositar
+    /// @param amountOutMin Mínimo de USDC a recibir al swappear
     function depositTokenAndSwap(address token, uint256 amount, uint256 amountOutMin)
         external
         nonReentrant
@@ -318,37 +402,44 @@ contract KipuBankV3 is AccessControl, ReentrancyGuard {
                                   RETIROS
     //////////////////////////////////////////////////////////////*/
 
+    /// @notice Retira USDC del balance del usuario.
+    /// @param amount Cantidad de USDC a retirar
     function withdrawUSDC(uint256 amount)
-    external
-    nonReentrant
-    nonZero(amount)
-{
-    uint256 bal = balances[USDC][msg.sender];
-    if (bal < amount) revert InsufficientBalance(bal, amount);
+        external
+        nonReentrant
+        nonZero(amount)
+    {
+        uint256 bal = balances[USDC][msg.sender];
+        if (bal < amount) revert InsufficientBalance(bal, amount);
 
-    // effects
-    balances[USDC][msg.sender] = bal - amount;
+        // effects
+        balances[USDC][msg.sender] = bal - amount;
 
-    unchecked {
-        if (totalDepositedUsd6 >= amount) {
-            totalDepositedUsd6 -= amount;
-        } else {
-            totalDepositedUsd6 = 0; // por seguridad defensiva
+        unchecked {
+            if (totalDepositedUsd6 >= amount) {
+                totalDepositedUsd6 -= amount;
+            } else {
+                totalDepositedUsd6 = 0; // por seguridad defensiva
+            }
+            withdrawCount++;
         }
-        withdrawCount++;
+
+        // interactions
+        IERC20(USDC).safeTransfer(msg.sender, amount);
+
+        emit Withdraw(USDC, msg.sender, amount, balances[USDC][msg.sender]);
     }
-
-    // interactions
-    IERC20(USDC).safeTransfer(msg.sender, amount);
-
-    emit Withdraw(USDC, msg.sender, amount, balances[USDC][msg.sender]);
-}
 
 
     /*//////////////////////////////////////////////////////////////
                            AUXILIAR: Chainlink a USD(6)
     //////////////////////////////////////////////////////////////*/
 
+    /// @notice Convierte un monto `amount` del `token` dado a USD(6) usando Chainlink.
+    /// @dev Requiere `priceFeed` configurado en `tokenConfig[token]`.
+    /// @param token Dirección del token a convertir
+    /// @param amount Monto del token a convertir
+    /// @return usd6 Monto expresado en USD(6)
     function _toUsd(address token, uint256 amount) internal view returns (uint256 usd6) {
         if (amount == 0) return 0;
         TokenConfig memory cfg = tokenConfig[token];
