@@ -1,7 +1,5 @@
 # KipuBankV3
 
-# KipuBankV3
-
 KipuBankV3 es una extensión de KipuBankV2 orientada a una aplicación DeFi más realista.  
 El objetivo principal de esta versión es permitir depósitos en cualquier token soportado por Uniswap V2, convertir esos depósitos automáticamente a USDC, y mantener el balance interno del usuario siempre en USDC.  
 Además, se conserva la lógica original de KipuBankV2 respecto al manejo de balances, retiros y control administrativo.
